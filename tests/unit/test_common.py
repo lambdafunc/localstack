@@ -1,21 +1,25 @@
+import base64
 import io
 import itertools
 import os
-import socket
 import threading
 import time
 import zipfile
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
-import pytz
 import yaml
 
 from localstack import config
 from localstack.utils import common
+from localstack.utils.archives import unzip
 from localstack.utils.common import (
-    Mock,
+    ExternalServicePortsManager,
+    PaginatedList,
+    PortNotAvailableException,
     fully_qualified_class_name,
+    get_free_tcp_port,
     is_empty_dir,
     load_file,
     mkdir,
@@ -24,6 +28,8 @@ from localstack.utils.common import (
     save_file,
     short_uid,
 )
+from localstack.utils.objects import Mock
+from localstack.utils.strings import base64_decode, to_bytes
 from localstack.utils.testutil import create_zip_file
 
 
@@ -44,6 +50,24 @@ class TestCommon:
         env = common.base64_to_hex("Zm9vIGJhcg ==")
         assert env == b"666f6f20626172"
 
+    def test_base64_decode(self):
+        def roundtrip(data):
+            encoded = base64.urlsafe_b64encode(to_bytes(data))
+            result = base64_decode(encoded)
+            assert to_bytes(data) == result
+
+        # simple examples
+        roundtrip("test")
+        roundtrip(b"test \x64 \x01 \x55")
+
+        # strings that require urlsafe encoding (containing "-" or "/" in base64 encoded form)
+        examples = ((b"=@~", b"PUB+"), (b"???", b"Pz8/"))
+        for decoded, encoded in examples:
+            assert base64.b64encode(decoded) == encoded
+            expected = encoded.replace(b"+", b"-").replace(b"/", b"_")
+            assert base64.urlsafe_b64encode(decoded) == expected
+            roundtrip(decoded)
+
     def test_now(self):
         env = common.now()
         test = time.time()
@@ -51,7 +75,7 @@ class TestCommon:
 
     def test_now_utc(self):
         env = common.now_utc()
-        test = datetime.now(pytz.UTC).timestamp()
+        test = datetime.now(timezone.utc).timestamp()
         assert test == pytest.approx(env, 1)
 
     def test_is_number(self):
@@ -70,18 +94,18 @@ class TestCommon:
 
     def test_mktime_with_tz(self):
         # see https://en.wikipedia.org/wiki/File:1000000000seconds.jpg
-        dt = datetime(2001, 9, 9, 1, 46, 40, 0, tzinfo=pytz.utc)
+        dt = datetime(2001, 9, 9, 1, 46, 40, 0, tzinfo=timezone.utc)
         assert int(common.mktime(dt)) == 1000000000
 
-        dt = datetime(2001, 9, 9, 1, 46, 40, 0, tzinfo=pytz.timezone("EST"))
+        dt = datetime(2001, 9, 9, 1, 46, 40, 0, tzinfo=ZoneInfo("EST"))
         assert int(common.mktime(dt)) == 1000000000 + (5 * 60 * 60)  # EST is UTC-5
 
     def test_mktime_millis_with_tz(self):
         # see https://en.wikipedia.org/wiki/File:1000000000
-        dt = datetime(2001, 9, 9, 1, 46, 40, 0, tzinfo=pytz.utc)
+        dt = datetime(2001, 9, 9, 1, 46, 40, 0, tzinfo=timezone.utc)
         assert int(common.mktime(dt, millis=True) / 1000) == 1000000000
 
-        dt = datetime(2001, 9, 9, 1, 46, 40, 0, tzinfo=pytz.timezone("EST"))
+        dt = datetime(2001, 9, 9, 1, 46, 40, 0, tzinfo=ZoneInfo("EST"))
         assert int(common.mktime(dt, millis=True)) / 1000 == 1000000000 + (
             5 * 60 * 60
         )  # EST is UTC-5
@@ -141,31 +165,6 @@ class TestCommon:
         result = common.clone_safe(obj)
         assert result == {"foo": ["value", 123, 1.23, True]}
 
-    def test_free_tcp_port_blacklist_raises_exception(self):
-        blacklist = range(0, 70000)  # blacklist all existing ports
-        with pytest.raises(Exception) as ctx:
-            common.get_free_tcp_port(blacklist)
-
-        assert "Unable to determine free TCP" in str(ctx.value)
-
-    def test_port_can_be_bound(self):
-        port = common.get_free_tcp_port()
-        assert common.port_can_be_bound(port)
-
-    def test_port_can_be_bound_illegal_port(self):
-        assert not common.port_can_be_bound(9999999999)
-
-    def test_port_can_be_bound_already_bound(self):
-        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            tcp.bind(("", 0))
-            addr, port = tcp.getsockname()
-            assert not common.port_can_be_bound(port)
-        finally:
-            tcp.close()
-
-        assert common.port_can_be_bound(port)
-
     def test_to_unique_item_list(self):
         assert common.to_unique_items_list([1, 1, 2, 2, 3]) == [1, 2, 3]
         assert common.to_unique_items_list(["a"]) == ["a"]
@@ -224,26 +223,6 @@ class TestCommon:
         cmd = "echo 'foobar'"
         result = common.run(cmd)
         assert result.strip() == "foobar"
-
-    def test_run_with_cache(self):
-        cmd = "python3 -c 'import time; print(int(time.time() * 1000))'"
-        d1 = float(common.run(cmd))
-        d2 = float(common.run(cmd, cache_duration_secs=1))
-        d3 = float(common.run(cmd, cache_duration_secs=1))
-
-        assert d1 != d2
-        assert d2 == d3
-
-    def test_run_with_cache_expiry(self):
-        cmd = "python3 -c 'import time; print(int(time.time() * 1000))'"
-
-        d1 = float(common.run(cmd, cache_duration_secs=0.5))
-        d2 = float(common.run(cmd, cache_duration_secs=0.5))
-        time.sleep(0.8)
-        d3 = float(common.run(cmd, cache_duration_secs=0.5))
-
-        assert d1 == d2
-        assert d2 != d3
 
     def test_is_command_available(self):
         assert common.is_command_available("python3")
@@ -390,7 +369,7 @@ class TestCommon:
         config.OUTBOUND_HTTPS_PROXY = old_https_proxy
 
     def test_fully_qualified_class_name(self):
-        assert fully_qualified_class_name(Mock) == "localstack.utils.common.Mock"
+        assert fully_qualified_class_name(Mock) == "localstack.utils.objects.Mock"
 
 
 class TestCommonFileOperations:
@@ -451,8 +430,6 @@ class TestCommonFileOperations:
         assert not fp.exists()
 
     def test_cp_r(self, tmp_path):
-        pytest.skip("this test does not work on python3.7 due to an issue shutil used by cp_r")
-
         source = tmp_path / "source"
         target = tmp_path / "target"
 
@@ -508,6 +485,26 @@ class TestCommonFileOperations:
         assert zip_obj.infolist()[0].filename == "testfile"
         rm_rf(tmp_dir)
 
+    def test_unzip_bad_crc(self):
+        """Test unzipping of files with incorrect CRC codes - usually works with native `unzip` command,
+        but seems to fail with zipfile module under certain Python versions (extracts 0-bytes files)
+        """
+
+        # base64-encoded zip file with a single entry with incorrect CRC (created by Node.js 18 / Serverless)
+        zip_base64 = """
+        UEsDBBQAAAAIAAAAIQAAAAAAJwAAAAAAAAAjAAAAbm9kZWpzL25vZGVfbW9kdWxlcy9sb2Rhc2gvaW5k
+        ZXguanPLzU8pzUnVS60oyC8qKVawVShKLSzNLErVUNfTz8lPSSzOUNe0BgBQSwECLQMUAAAACAAAACEA
+        AAAAACcAAAAAAAAAIwAAAAAAAAAAACAApIEAAAAAbm9kZWpzL25vZGVfbW9kdWxlcy9sb2Rhc2gvaW5k
+        ZXguanNQSwUGAAAAAAEAAQBRAAAAaAAAAAAA
+        """
+        tmp_dir = new_tmp_dir()
+        zip_file = os.path.join(tmp_dir, "test.zip")
+        save_file(zip_file, base64.b64decode(zip_base64))
+        unzip(zip_file, tmp_dir)
+        content = load_file(os.path.join(tmp_dir, "nodejs", "node_modules", "lodash", "index.js"))
+        assert content.strip() == "module.exports = require('./lodash');"
+        rm_rf(tmp_dir)
+
 
 def test_save_load_file(tmp_path):
     file_name = tmp_path / ("normal_permissions_%s" % short_uid())
@@ -551,3 +548,108 @@ def test_save_load_file_with_changing_permissions(tmp_path):
     save_file(file_name, content, permissions=permissions)
     assert permissions != os.stat(file_name).st_mode & 0o777
     assert content == load_file(file_name)
+
+
+@pytest.fixture()
+def external_service_ports_manager():
+    previous_start = config.EXTERNAL_SERVICE_PORTS_START
+    previous_end = config.EXTERNAL_SERVICE_PORTS_END
+    # Limit the range to only contain a single port
+    config.EXTERNAL_SERVICE_PORTS_START = get_free_tcp_port()
+    config.EXTERNAL_SERVICE_PORTS_END = config.EXTERNAL_SERVICE_PORTS_START + 1
+    yield ExternalServicePortsManager()
+    config.EXTERNAL_SERVICE_PORTS_END = previous_end
+    config.EXTERNAL_SERVICE_PORTS_START = previous_start
+
+
+class TestExternalServicePortsManager:
+    def test_reserve_port_within_range(
+        self, external_service_ports_manager: ExternalServicePortsManager
+    ):
+        port = external_service_ports_manager.reserve_port(config.EXTERNAL_SERVICE_PORTS_START)
+        assert port == config.EXTERNAL_SERVICE_PORTS_START
+
+    def test_reserve_port_outside_range(
+        self, external_service_ports_manager: ExternalServicePortsManager
+    ):
+        with pytest.raises(PortNotAvailableException):
+            external_service_ports_manager.reserve_port(config.EXTERNAL_SERVICE_PORTS_END + 1)
+
+    def test_reserve_any_port_within_range(
+        self, external_service_ports_manager: ExternalServicePortsManager
+    ):
+        port = external_service_ports_manager.reserve_port()
+        assert port == config.EXTERNAL_SERVICE_PORTS_START
+
+    def test_reserve_port_all_reserved(
+        self, external_service_ports_manager: ExternalServicePortsManager
+    ):
+        # the external service ports manager fixture only has 2 ports available,
+        # reserving 3 has to raise an error, but this could also happen earlier
+        # (if one of the ports is blocked by something else, like a previous test)
+        with pytest.raises(PortNotAvailableException):
+            external_service_ports_manager.reserve_port()
+            external_service_ports_manager.reserve_port()
+            external_service_ports_manager.reserve_port()
+
+    def test_reserve_same_port_twice(
+        self, external_service_ports_manager: ExternalServicePortsManager
+    ):
+        external_service_ports_manager.reserve_port(config.EXTERNAL_SERVICE_PORTS_START)
+        with pytest.raises(PortNotAvailableException):
+            external_service_ports_manager.reserve_port(config.EXTERNAL_SERVICE_PORTS_START)
+
+    def test_reserve_custom_expiry(
+        self, external_service_ports_manager: ExternalServicePortsManager
+    ):
+        external_service_ports_manager.reserve_port(config.EXTERNAL_SERVICE_PORTS_START, duration=1)
+        with pytest.raises(PortNotAvailableException):
+            external_service_ports_manager.reserve_port(config.EXTERNAL_SERVICE_PORTS_START)
+        time.sleep(1)
+        external_service_ports_manager.reserve_port(config.EXTERNAL_SERVICE_PORTS_START)
+
+    def test_check_is_port_reserved(
+        self, external_service_ports_manager: ExternalServicePortsManager
+    ):
+        assert not external_service_ports_manager.is_port_reserved(
+            config.EXTERNAL_SERVICE_PORTS_START
+        )
+        external_service_ports_manager.reserve_port(config.EXTERNAL_SERVICE_PORTS_START)
+        assert external_service_ports_manager.is_port_reserved(config.EXTERNAL_SERVICE_PORTS_START)
+
+
+@pytest.fixture()
+def paginated_list():
+    yield PaginatedList([{"Id": i, "Filter": i.upper()} for i in ["a", "b", "c", "d", "e"]])
+
+
+class TestPaginatedList:
+    def test_list_smaller_than_max(self, paginated_list):
+        page, next_token = paginated_list.get_page(lambda i: i["Id"], page_size=6)
+        assert len(page) == 5
+        assert next_token is None
+
+    def test_next_token(self, paginated_list):
+        page, next_token = paginated_list.get_page(lambda i: i["Id"], page_size=2)
+        assert len(page) == 2
+        assert next_token == "c"
+
+    def test_continuation(self, paginated_list):
+        page, next_token = paginated_list.get_page(lambda i: i["Id"], page_size=2, next_token="c")
+        assert len(page) == 2
+        assert next_token == "e"
+
+    def test_end(self, paginated_list):
+        page, next_token = paginated_list.get_page(lambda i: i["Id"], page_size=2, next_token="e")
+        assert len(page) == 1
+        assert next_token is None
+
+    def test_filter(self, paginated_list):
+        page, next_token = paginated_list.get_page(
+            lambda i: i["Id"], page_size=6, filter_function=lambda i: i["Filter"] in ["B", "E"]
+        )
+        assert len(page) == 2
+        ids = [i["Id"] for i in page]
+        assert "b" in ids and "e" in ids
+        assert "a" not in ids
+        assert next_token is None
